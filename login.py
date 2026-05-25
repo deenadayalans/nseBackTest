@@ -76,8 +76,9 @@ def main() -> None:
     print(f"\n✓  Logged in as: {data['user_id']} ({data.get('user_name', '')})")
     print(f"✓  Access token saved to .env  (valid until midnight IST)")
     print(f"\nYou can now run:")
-    print(f"  python download_data.py   ← fetch real Nifty data")
-    print(f"  python backtest.py        ← run strategies on real data")
+    print(f"  python start.py           ← recommended: alerts + EOD tasks auto-run")
+    print(f"  python live_alerter.py    ← just the live alerts")
+    print(f"  python oeh_reversal.py    ← just the backtest")
 
 
 if __name__ == "__main__":

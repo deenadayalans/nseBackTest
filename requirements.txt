@@ -1,20 +1,15 @@
-# Core data & analysis
-kiteconnect>=4.2.0
-pandas>=2.0.0
-numpy>=1.24.0
-pyarrow>=12.0.0       # Parquet storage
+# OEH Backtest & Live Alerter — Python 3.11–3.13
+# Install:  pip install -r requirements.txt
 
-# Backtesting
-backtrader>=1.9.78
-
-# Technical indicators
-pandas-ta>=0.3.14b
-
-# LLM integrations
-anthropic>=0.25.0     # Claude API
-ollama>=0.1.8         # Local models via Ollama
-
-# Scheduling & utils
-schedule>=1.2.0
-python-dotenv>=1.0.0
-rich>=13.0.0          # Pretty terminal output
+kiteconnect==5.2.0        # Zerodha Kite Connect API + WebSocket
+pandas==3.0.3
+numpy==2.2.6
+pyarrow==24.0.0           # Parquet file storage
+scipy==1.17.1             # Black-Scholes option pricing
+requests==2.34.2          # WhatsApp / Telegram HTTP alerts
+python-dotenv==1.2.2      # Load .env config
+pandas-ta==0.4.71b0       # Technical indicators (SuperTrend, EMA etc.)
+backtrader==1.9.78.123    # Backtesting engine (legacy, kept for compatibility)
+rich==15.0.0              # Pretty terminal output
+schedule==1.2.2           # Scheduling helpers
+tqdm==4.67.3              # Progress bars

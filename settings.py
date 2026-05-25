@@ -37,6 +37,20 @@ class Config:
     MAX_OPEN_TRADES:          int   = 1
     STOP_LOSS_ATR_MULTIPLIER: float = 1.5
 
+    # ── Trading capital & sizing ──────────────────────────────────
+    INITIAL_CAPITAL:  float = field(default_factory=lambda: float(_env("INITIAL_CAPITAL",  "200000")))
+    DEPLOY_PCT:       float = field(default_factory=lambda: float(_env("DEPLOY_PCT",        "0.20")))
+    MAX_LOTS_NIFTY:   int   = field(default_factory=lambda: int(_env("MAX_LOTS_NIFTY",    "10")))
+    MAX_LOTS_SENSEX:  int   = field(default_factory=lambda: int(_env("MAX_LOTS_SENSEX",   "20")))
+
+    # ── Telegram alerts ───────────────────────────────────────────
+    TG_BOT_TOKEN: str = field(default_factory=lambda: _env("TG_BOT_TOKEN"))
+    TG_CHAT_ID:   str = field(default_factory=lambda: _env("TG_CHAT_ID"))
+
+    # ── WhatsApp alerts (CallMeBot) ───────────────────────────────
+    WA_PHONE:  str = field(default_factory=lambda: _env("WA_PHONE"))
+    WA_APIKEY: str = field(default_factory=lambda: _env("WA_APIKEY"))
+
     # ── LLM mode ─────────────────────────────────────────────────
     LLM_MODE: str = field(default_factory=lambda: _env("LLM_MODE", "claude"))
 
