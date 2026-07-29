@@ -123,24 +123,40 @@ def do_login() -> bool:
 # ── Live alerter (blocks until market close) ──────────────────────────────────
 
 def do_live_alerter() -> None:
-    banner("STEP 2 — Live Alerter (runs until 3:30 PM IST)")
-    now = datetime.now(IST).time()
-    market_close = dtime(15, 30)
+    # Reload settings so fresh token is visible
+    import importlib
+    import settings as _s
+    importlib.reload(_s)
+    cfg = _s.settings
 
-    if now >= market_close:
+    # Determine mode for display
+    auto_on     = cfg.AUTO_TRADE
+    max_lots    = cfg.MAX_LOTS_AUTO
+    loss_cap    = cfg.DAILY_LOSS_CAP
+
+    if auto_on:
+        mode_line = (
+            f"{G}  ⚡ AUTO-TRADE ON{W}  —  "
+            f"max {max_lots} lot(s)  |  daily loss cap ₹{loss_cap:,.0f}"
+        )
+        tip = "Auto-trader will place real orders on OEH/OEL signals."
+    else:
+        mode_line = f"{Y}  ALERTS ONLY{W}  —  AUTO_TRADE=false in .env  (no real orders)"
+        tip = "Set AUTO_TRADE=true in .env to enable live order placement."
+
+    banner("STEP 2 — Live Alerter + Auto Trader (runs until 3:30 PM IST)")
+    print(mode_line)
+    print(f"     {tip}")
+    print(f"\n  To change mode: edit .env → AUTO_TRADE=true/false → restart.\n")
+
+    now = datetime.now(IST).time()
+    if now >= dtime(15, 30):
         warn("Market already closed — skipping live alerter")
         return
 
-    print("  Live alerter is running. It will exit automatically at 3:30 PM.")
-    print("  You will receive Telegram/WhatsApp alerts for OEH setups.")
-    print("  Press Ctrl+C here to stop early.\n")
+    print("  Press Ctrl+C to stop early.\n")
 
-    # Run in the same process so Ctrl+C works naturally
     try:
-        # Reload settings with fresh token from .env
-        import importlib
-        import settings as _s
-        importlib.reload(_s)
         from live_alerter import OEHAlerter
         alerter = OEHAlerter()
         alerter.run()
@@ -171,7 +187,8 @@ def main():
     args = set(sys.argv[1:])
 
     banner("NSE OEH Trading System", colour=G)
-    print(f"  {datetime.now(IST).strftime('%A, %d %b %Y  %H:%M IST')}\n")
+    print(f"  {datetime.now(IST).strftime('%A, %d %b %Y  %H:%M IST')}")
+    print(f"  Modes controlled by .env  →  AUTO_TRADE | MAX_LOTS_AUTO | DAILY_LOSS_CAP\n")
 
     # ── Mode: just login ──────────────────────────────────────────────────────
     if "--login" in args:

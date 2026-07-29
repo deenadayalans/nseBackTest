@@ -43,6 +43,13 @@ class Config:
     MAX_LOTS_NIFTY:   int   = field(default_factory=lambda: int(_env("MAX_LOTS_NIFTY",    "10")))
     MAX_LOTS_SENSEX:  int   = field(default_factory=lambda: int(_env("MAX_LOTS_SENSEX",   "20")))
 
+    # ── Automated execution ───────────────────────────────────────
+    # AUTO_TRADE=true  → system places real orders on OEH signal
+    # AUTO_TRADE=false → alerts only (default / safe)
+    AUTO_TRADE:      bool  = field(default_factory=lambda: _env("AUTO_TRADE", "false").lower() == "true")
+    MAX_LOTS_AUTO:   int   = field(default_factory=lambda: int(_env("MAX_LOTS_AUTO", "1")))
+    DAILY_LOSS_CAP:  float = field(default_factory=lambda: float(_env("DAILY_LOSS_CAP", "3000")))
+
     # ── Telegram alerts ───────────────────────────────────────────
     TG_BOT_TOKEN: str = field(default_factory=lambda: _env("TG_BOT_TOKEN"))
     TG_CHAT_ID:   str = field(default_factory=lambda: _env("TG_CHAT_ID"))

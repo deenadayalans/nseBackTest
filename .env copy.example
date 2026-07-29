@@ -26,3 +26,10 @@ INITIAL_CAPITAL=200000
 DEPLOY_PCT=0.20
 MAX_LOTS_NIFTY=10
 MAX_LOTS_SENSEX=20
+
+# ── Automated execution ────────────────────────────────────────────────────────
+# AUTO_TRADE=true  → system places REAL orders via Kite API on OEH signal
+# AUTO_TRADE=false → alert-only mode (default — safe to leave on while testing)
+# MAX_LOTS_AUTO    → hard cap for auto-trading (start at 1 lot to test plumbing)
+AUTO_TRADE=false
+MAX_LOTS_AUTO=1

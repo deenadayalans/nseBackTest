@@ -50,11 +50,11 @@ MAX_WAIT_BARS   = 30      # give up if no reversal within this many bars after O
 TARGET_PCT      = 55.0    # % gain on premium to exit (₹50 → ₹77.5)
 STOP_PCT        = 50.0    # % loss on premium to exit  (₹50 → ₹25)
 # Instrument-specific premium range at entry
-# Nifty ATM ~24k level → ₹25–100 is the sweet spot
-# Sensex ATM ~80k level → ₹100–200 is the right range
+# Nifty ATM ~24k level → ₹25–200 covers both pre-expiry and expiry day premiums
+# Sensex ATM ~80k level → ₹100–300 covers expiry day premiums
 OPTION_PX_RANGE = {
-    "NIFTY50": (25,  100),
-    "SENSEX":  (100, 200),
+    "NIFTY50": (25,  200),
+    "SENSEX":  (100, 300),
 }
 
 # ── SuperTrend + EMA config ───────────────────────────────────────────────────
@@ -73,7 +73,8 @@ REQUIRE_DAILY_DMA = True   # Require price > 20 DMA on daily chart (trend direct
 
 # 5-min confirmations
 REQUIRE_ST_CONF   = True   # prev bar's 5-min ST must be BUY at OEH bar
-REQUIRE_EMA_CONF  = True   # OEH bar open > EMA-50 (broad uptrend)
+REQUIRE_EMA_CONF  = True   # OEH bar open must be within EMA_CONF_SLACK % below EMA-50
+EMA_CONF_SLACK    = 0.5    # % — allow OEH up to this far below EMA-50 (handles marginal cases)
 REQUIRE_ENTRY_EMA = False  # EMA-9 at entry already implicit via MIN_SPOT_DROP + 2-bar reversal
 
 EARLIEST_ENTRY  = time(9, 20)
@@ -92,10 +93,12 @@ MAX_LOTS_SENSEX   = _settings.MAX_LOTS_SENSEX
 HV_WINDOW = 20
 
 # Active weekdays: (expiry_dow, pre_expiry_dow)
-# Set pre_expiry_dow to None to trade expiry days only
+# 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri
+# Nifty  expires Tuesday  → trade Mon (pre-expiry) + Tue (expiry)
+# Sensex expires Thursday → trade Wed (pre-expiry) + Thu (expiry)
 SCHEDULE = {
-    "NIFTY50": (1, None),   # Tue expiry only
-    "SENSEX":  (3, None),   # Thu expiry only
+    "NIFTY50": (1, 0),   # Tue expiry + Mon pre-expiry
+    "SENSEX":  (3, 2),   # Thu expiry + Wed pre-expiry
 }
 
 
@@ -392,8 +395,9 @@ def run(symbol: str, df5: pd.DataFrame, df1d: pd.DataFrame,
                     # just before the pullback started.
                     st_buy_before_oeh = prev_bar["st_direction"] == 1
                     # EMA-50 check at OEH bar's OPEN (= the OEH high level)
-                    # — OEH open must be above the trend EMA (confirms uptrend context)
-                    above_trend_ema   = bar["open"] > bar["ema_trend"]
+                    # — OEH open must be within EMA_CONF_SLACK% below EMA-50
+                    # (strict > was rejecting valid setups marginally below EMA)
+                    above_trend_ema   = bar["open"] >= bar["ema_trend"] * (1 - EMA_CONF_SLACK / 100)
 
                     if REQUIRE_ST_CONF and not st_buy_before_oeh:
                         prev_bar = bar

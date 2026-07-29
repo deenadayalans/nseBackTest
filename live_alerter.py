@@ -41,12 +41,14 @@ from kiteconnect import KiteTicker, KiteConnect
 from settings import settings
 from kite_data import load_historical, load_kite_with_token
 from trade_journal import TradeJournal
+from auto_trader import AutoTrader
 from oeh_reversal import (
     compute_indicators, _supertrend,
     DAILY_ST_ATR, DAILY_ST_MULT,
+    ST_ATR_PERIOD, ST_MULTIPLIER,
     OEH_TOLERANCE, MIN_DROP, REVERSAL_BARS,
     MIN_SPOT_DROP, EMA_FAST, EMA_TREND,
-    SCHEDULE,
+    EMA_CONF_SLACK, SCHEDULE, OPTION_PX_RANGE,
 )
 
 # ── Timezone ──────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ MORNING_BRIEF_TIME = dtime(9, 20)
 OEH_WINDOW_START   = dtime(9, 20)
 OEH_WINDOW_END     = dtime(12, 30)    # 9:15–12:30 works well per user's experience
 MARKET_CLOSE       = dtime(15, 30)
-CANDLE_MINS        = 5
+CANDLE_MINS        = 3    # 3-min candles: earlier signals, better on expiry day
 
 # ── Instruments ───────────────────────────────────────────────────────────────
 NIFTY_SPOT_TOKEN  = 256265
@@ -66,6 +68,7 @@ SENSEX_SPOT_TOKEN = 265
 NIFTY_STRIKE_STEP  = 50
 SENSEX_STRIKE_STEP = 100
 STRIKES_EACH_SIDE  = 5    # ATM ± 5 → 11 CE + 11 PE strikes
+OPT_OEH_TOLERANCE = 1.0   # % — option open≈high tolerance (wider than spot due to spread)
 
 # ── OEH detection parameters (must match oeh_reversal.py) ────────────────────
 OEH_TOL_PCT  = OEH_TOLERANCE   # 0.05%
@@ -453,6 +456,12 @@ class OEHStateMachine:
                     return "oeh_formed"
 
         elif self.state == "oeh_seen":
+            # If ST turns bearish mid-sequence, abort — bias no longer supports CE
+            if st_dir == -1:
+                log.info(f"{self.symbol}: ST flipped bearish — resetting OEH sequence")
+                self.reset()
+                return None
+
             self.wait_bars += 1
             if self.wait_bars > 30:
                 self.reset()
@@ -484,6 +493,104 @@ class OEHStateMachine:
                     return f"reversal_bar_{self.consec_up}"
             elif self.consec_up > 0:
                 return f"reversal_bar_{self.consec_up}"
+
+        return None
+
+
+class OELStateMachine:
+    """
+    Tracks OEL (Open = Low) detection and bearish reversal for PE trades.
+    Mirror of OEHStateMachine:
+      - Opening candle open ≈ low (price cannot go lower → false floor)
+      - Price rallies above OEL by MIN_SPOT_DROP%
+      - Then 2 consecutive red (lower-close) bars confirm reversal DOWN
+      - Buy ATM PUT, target = back to OEL level and below
+    """
+
+    def __init__(self, symbol: str):
+        self.symbol      = symbol
+        self.state       = "watch"
+        self.oel_spot    = None
+        self.oel_time    = None
+        self.consec_dn   = 0
+        self.last_close  = None
+        self.wait_bars   = 0
+        self.journal_sid = None
+
+    def reset(self):
+        self.state       = "watch"
+        self.oel_spot    = None
+        self.oel_time    = None
+        self.consec_dn   = 0
+        self.last_close  = None
+        self.wait_bars   = 0
+        self.journal_sid = None
+
+    def on_candle(self, bar: dict, prev_bar: dict | None,
+                  st_dir: int, ema50: float, ema9: float,
+                  t: dtime) -> str | None:
+        """
+        Feed a completed candle. Returns alert type string or None.
+        alert types: 'oel_formed', 'reversal_bar_dn_N', 'entry_confirmed_pe'
+        """
+        o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+
+        if t < OEH_WINDOW_START or t > OEH_WINDOW_END:
+            return None
+
+        if self.state == "watch":
+            # OEL: open ≈ low AND candle rallied ≥ MIN_DROP%
+            gap  = abs(o - l) / l * 100 if l > 0 else 99
+            rise = (c - o) / o * 100    if o > 0 else 0
+            if gap <= OEH_TOL_PCT and rise >= MIN_DROP_PCT:
+                # Pre-OEL bar must have ST=SELL and price below (or within slack of) EMA-50
+                prev_st_sell = (prev_bar is not None and prev_bar.get("st_dir", 1) == -1)
+                below_ema50  = o < ema50 * (1 + EMA_CONF_SLACK / 100)
+                if prev_st_sell and below_ema50:
+                    self.state      = "oel_seen"
+                    self.oel_spot   = o
+                    self.oel_time   = t.strftime("%H:%M")
+                    self.consec_dn  = 0
+                    self.last_close = c
+                    self.wait_bars  = 0
+                    return "oel_formed"
+
+        elif self.state == "oel_seen":
+            # If ST turns bullish mid-sequence, abort — bias no longer supports PE
+            if st_dir == 1:
+                log.info(f"{self.symbol}: ST flipped bullish — resetting OEL sequence")
+                self.reset()
+                return None
+
+            self.wait_bars += 1
+            if self.wait_bars > 30:
+                self.reset()
+                return None
+
+            # Require a meaningful rally above OEL before the breakdown
+            rise_from_oel = (c - self.oel_spot) / self.oel_spot * 100 if self.oel_spot else 0
+            if rise_from_oel < MIN_SPOT_DROP:
+                self.last_close = c
+                self.consec_dn  = 0
+                return None
+
+            # Bearish reversal bars: red (close < open) AND lower close
+            is_red   = c < o
+            is_lower = self.last_close is not None and c < self.last_close
+            if is_red and is_lower:
+                self.consec_dn += 1
+            else:
+                self.consec_dn = 0
+            self.last_close = c
+
+            if self.consec_dn >= REVERSAL_BARS:
+                if c < ema9:   # below EMA-9 → downward momentum confirmed
+                    self.state = "signalled"
+                    return "entry_confirmed_pe"
+                else:
+                    return f"reversal_bar_dn_{self.consec_dn}"
+            elif self.consec_dn > 0:
+                return f"reversal_bar_dn_{self.consec_dn}"
 
         return None
 
@@ -670,6 +777,103 @@ def fmt_entry_alert(symbol: str, bar: dict, oeh_spot: float,
     )
 
 
+def fmt_oel_alert(symbol: str, bar: dict, oel_time: str,
+                  st_dir: int, ema50_5m: float,
+                  dma20: float = 0, dma50: float = 0) -> str:
+    """OEL spotted — bearish heads-up."""
+    name     = "NIFTY" if symbol == "NIFTY50" else "SENSEX"
+    oel_lvl  = bar["open"]
+    close    = bar["close"]
+    rise_pts = close - oel_lvl
+    rise_pct = rise_pts / oel_lvl * 100
+    bear = sum([
+        st_dir == -1,
+        oel_lvl < ema50_5m,
+        oel_lvl < dma20 if dma20 else True,
+        oel_lvl < dma50 if dma50 else True,
+    ])
+    confidence = {4: "Strong ✅✅", 3: "Good ✅", 2: "Weak ⚠️", 1: "Poor ❌"}.get(bear, "❌")
+    return (
+        f"👀 *OEL SPOTTED — {name}*\n"
+        f"⏰ {oel_time}\n\n"
+        f"Open = Low = *{oel_lvl:,.0f}*\n"
+        f"Rallied to: {close:,.0f}  (+{rise_pts:.0f}pts ↑{rise_pct:.2f}%)\n\n"
+        f"Bearish confidence: {confidence}\n\n"
+        f"⏳ Watching for breakdown below OEL...\n"
+        f"Will alert on each red bar → PE entry when confirmed 🔔"
+    )
+
+
+def fmt_oel_reversal_update(symbol: str, bar: dict, oel_spot: float,
+                             bar_num: int, needed: int) -> str:
+    """Progress update on bearish reversal bars."""
+    name     = "NIFTY" if symbol == "NIFTY50" else "SENSEX"
+    close    = bar["close"]
+    rise_pts = close - oel_spot
+    rise_pct = rise_pts / oel_spot * 100
+    remain   = needed - bar_num
+    prog     = "🔴" * bar_num + "⬛" * remain
+    if remain == 0:
+        status = "PE entry alert coming next! 🚀"
+    elif remain == 1:
+        status = "One more red bar and we enter PE! 🔜"
+    else:
+        status = f"{remain} more red bars needed"
+    return (
+        f"{prog} *{name} — Bearish Reversal {bar_num}/{needed}*\n"
+        f"OEL: {oel_spot:,.0f} | Now: {close:,.0f}\n"
+        f"Still {rise_pts:.0f}pts ({rise_pct:.2f}%) above OEL\n"
+        f"{status}"
+    )
+
+
+def fmt_pe_entry_alert(symbol: str, bar: dict, oel_spot: float,
+                        opt_rows: list[dict], step: int,
+                        dma20: float = 0, dma50: float = 0) -> str:
+    """PE entry confirmed — full option chain for puts."""
+    name      = "NIFTY" if symbol == "NIFTY50" else "SENSEX"
+    spot_now  = bar["close"]
+    rise_pts  = spot_now - oel_spot
+    rise_pct  = rise_pts / oel_spot * 100
+    atm       = int(round(spot_now / step) * step)
+    lots      = 4 if symbol == "NIFTY50" else 5
+    qty       = lots * (65 if symbol == "NIFTY50" else 20)
+
+    rows = [r for r in opt_rows if r["type"] == "PE"]
+    if rows:
+        chain_lines = []
+        for r in rows:
+            ltp    = r["ltp"]
+            target = round(ltp * 1.55)
+            stop   = round(ltp * 0.50)
+            atm_tag = " ◀ ATM" if r["strike"] == atm else ""
+            chain_lines.append(
+                f"  {r['strike']}: ₹{ltp:.0f}  T:₹{target}  S:₹{stop}{atm_tag}"
+            )
+        pe_chain = "\n".join(chain_lines)
+    else:
+        pe_chain = "  no PE data"
+
+    dma_conf = ""
+    if dma20:
+        dma_conf += f"  20DMA ({'⚠️' if spot_now < dma20 else '✅'})  "
+    if dma50:
+        dma_conf += f"50DMA ({'⚠️' if spot_now < dma50 else '✅'})"
+
+    return (
+        f"🔻 *ENTER PE NOW — {name} BEARISH REVERSAL CONFIRMED*\n"
+        f"{'🔴' * REVERSAL_BARS} {REVERSAL_BARS} red bars done!\n\n"
+        f"OEL level: {oel_spot:,.0f}\n"
+        f"Spot now:  {spot_now:,.0f}  (+{rise_pts:.0f}pts above OEL)\n"
+        f"Target: break below {oel_spot:,.0f}\n\n"
+        f"*PE strikes* (buy for downside):\n{pe_chain}\n\n"
+        f"Qty: {lots} lots ({qty} units)\n"
+        f"ST ✅ | EMA below ✅ | Rise ✅"
+        + (f" | {dma_conf}" if dma_conf else "")
+        + f"\n\n⚡ Enter at market — target +55%, stop -50%"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main alerter class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -681,10 +885,14 @@ class OEHAlerter:
         self.builder       = CandleBuilder(CANDLE_MINS)
         self.journal       = TradeJournal()   # daily trade log
 
-        # One state machine per instrument
+        # OEH (CE) and OEL (PE) state machines per instrument
         self.state_machines = {
             "NIFTY50": OEHStateMachine("NIFTY50"),
             "SENSEX":  OEHStateMachine("SENSEX"),
+        }
+        self.oel_machines = {
+            "NIFTY50": OELStateMachine("NIFTY50"),
+            "SENSEX":  OELStateMachine("SENSEX"),
         }
 
         # Spot tokens per instrument
@@ -693,14 +901,61 @@ class OEHAlerter:
             SENSEX_SPOT_TOKEN: "SENSEX",
         }
 
-        self.opt_tokens    = {}       # token → meta (populated after open)
-        self.indicators    = {}       # symbol → {"ema50", "ema9", "st_dir", "daily_st"}
-        self.brief_sent    = False
-        self.prev_bars     = {}       # token → last completed bar
-        self._lock         = threading.Lock()
-        self._active_today = set()   # symbols active today per schedule + daily ST
+        self.opt_tokens       = {}       # token → meta (populated after open)
+        self.indicators       = {}       # symbol → {"ema50", "ema9", "st_dir", "daily_st"}
+        self.brief_sent       = False
+        self.prev_bars        = {}       # token → last completed bar
+        self._lock            = threading.Lock()
+        self._active_today    = set()    # symbols active today per schedule + daily ST
+        self._opt_oeh_alerted  = set()    # (expiry, strike) pairs already alerted
+        self._ticker           = None     # KiteTicker ref (set in run())
+        self._price_alerts: list[dict] = []   # [{tsymbol, token, level, direction, fired}]
+        self._opt_50_levels: dict[int, dict] = {}  # token → 50% reversal tracker
+        self._trendline_cache: dict[str, str] = {}  # symbol → last trendline status string
+
+        self.auto_trader = AutoTrader(
+            kite           = self.kite,
+            send_alert_fn  = send_alert,
+            dry_run        = not settings.AUTO_TRADE,
+            max_lots       = settings.MAX_LOTS_AUTO,
+            daily_loss_cap = settings.DAILY_LOSS_CAP,
+        )
 
     # ── Pre-compute daily indicators ──────────────────────────────────────────
+
+    def _is_expiry_today(self, symbol: str, today) -> bool:
+        """
+        Check if today is the actual expiry date for this symbol's weekly options.
+        Handles holiday-shifted expiries (e.g. Thursday holiday → expiry moved to Wednesday).
+        Calls the Kite instruments API — result cached per day.
+        """
+        cache_key = f"_expiry_cache_{symbol}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+
+        try:
+            exchange = "NFO" if symbol == "NIFTY50" else "BFO"
+            name     = "NIFTY" if symbol == "NIFTY50" else "SENSEX"
+            insts    = self.kite.instruments(exchange)
+            df       = pd.DataFrame(insts)
+            df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+            opts     = df[(df["name"] == name) &
+                          (df["instrument_type"].isin(["CE", "PE"]))]
+            future   = opts[opts["expiry"] >= today]
+            if future.empty:
+                setattr(self, cache_key, False)
+                return False
+            nearest = future["expiry"].min()
+            result  = (nearest == today)
+            setattr(self, cache_key, result)
+            if result:
+                log.info(f"{symbol}: actual expiry date confirmed = {today}")
+            return result
+        except Exception as e:
+            log.debug(f"{symbol}: expiry check failed — {e}")
+            setattr(self, cache_key, False)
+            return False
 
     def load_daily_indicators(self):
         """
@@ -714,10 +969,19 @@ class OEHAlerter:
             exp_dow, pre_dow = SCHEDULE[symbol]
             active_dows = {d for d in (exp_dow, pre_dow) if d is not None}
 
-            # Schedule gate — only active on Mon+Tue (Nifty) or Wed+Thu (Sensex)
-            if dow not in active_dows:
+            # Schedule gate — Mon+Tue for Nifty, Wed+Thu for Sensex.
+            # Exception: if today IS the actual expiry date (holiday-shifted expiry),
+            # activate regardless of the normal weekday.
+            is_normal_day     = dow in active_dows
+            is_shifted_expiry = self._is_expiry_today(symbol, today)
+
+            if not is_normal_day and not is_shifted_expiry:
                 log.info(f"{symbol}: not active today (dow={dow})")
                 continue
+
+            if is_shifted_expiry and not is_normal_day:
+                log.info(f"{symbol}: HOLIDAY-SHIFTED EXPIRY today ✅ "
+                         f"(normal {('Mon+Tue' if symbol=='NIFTY50' else 'Wed+Thu')} moved to {today})")
 
             try:
                 df5  = load_historical(symbol, "5min")
@@ -771,18 +1035,192 @@ class OEHAlerter:
 
     # ── Subscribe to live option tokens ──────────────────────────────────────
 
+    def _option_is_relevant(self, opt_info: dict) -> bool:
+        """
+        Returns True only if this option should be tracked for alerts.
+
+        Rules:
+          1. Direction matches current bias:
+               CE → 5mST must be bullish (st5 == 1)
+               PE → 5mST must be bearish (st5 == -1)
+          2. Strike is ATM or OTM (not ITM):
+               CE → strike >= ATM (current spot rounded to step)
+               PE → strike <= ATM
+          3. Strike is within 3 steps of ATM (avoid far-wing noise).
+        """
+        sym      = "NIFTY50" if "NIFTY" in opt_info["tsymbol"] else "SENSEX"
+        step     = NIFTY_STRIKE_STEP if sym == "NIFTY50" else SENSEX_STRIKE_STEP
+        st_now   = self.indicators.get(sym, {}).get("st5", 0)
+        opt_type = opt_info["type"]
+        strike   = opt_info["strike"]
+
+        # Bias direction gate
+        if opt_type == "CE" and st_now != 1:
+            return False
+        if opt_type == "PE" and st_now != -1:
+            return False
+
+        # Get current ATM
+        spot_token = NIFTY_SPOT_TOKEN if sym == "NIFTY50" else SENSEX_SPOT_TOKEN
+        spot       = self._get_spot_ltp(sym, spot_token)
+        if not spot:
+            return True   # can't determine ATM, let it through
+
+        atm = round(spot / step) * step
+
+        # ATM or OTM only
+        if opt_type == "CE" and strike < atm:
+            return False   # ITM call
+        if opt_type == "PE" and strike > atm:
+            return False   # ITM put
+
+        # Within 3 strikes of ATM
+        if abs(strike - atm) > 3 * step:
+            return False
+
+        return True
+
+    def _get_spot_ltp(self, symbol: str, spot_token: int) -> float | None:
+        """
+        Best-effort spot price for ATM calculation.
+        Priority:
+          1. kite.ltp() — always current, works even before first candle completes
+          2. current in-progress bar close (WebSocket tick, candle not yet closed)
+          3. last completed bar close
+        Returns None only if all three fail.
+        """
+        exchange = "NSE" if symbol == "NIFTY50" else "BSE"
+        trading_symbol = "NIFTY 50" if symbol == "NIFTY50" else "SENSEX"
+        try:
+            resp = self.kite.ltp([f"{exchange}:{trading_symbol}"])
+            price = next(iter(resp.values()), {}).get("last_price", 0)
+            if price > 0:
+                return price
+        except Exception as e:
+            log.debug(f"kite.ltp() failed for {symbol}: {e}")
+
+        # Fallback: in-progress candle tick
+        cur = self.builder.current_bar(spot_token)
+        if cur and cur.get("close", 0) > 0:
+            return cur["close"]
+
+        # Fallback: last completed candle
+        last = self.builder.last_bar(spot_token)
+        if last and last.get("close", 0) > 0:
+            return last["close"]
+
+        return None
+
     def refresh_option_tokens(self):
         """Fetch ATM ± N option tokens for all active instruments today."""
+        new_tokens: dict = {}
         for symbol in self._active_today:
             spot_token = NIFTY_SPOT_TOKEN if symbol == "NIFTY50" else SENSEX_SPOT_TOKEN
-            last = self.builder.last_bar(spot_token)
-            if last is None:
+            ltp = self._get_spot_ltp(symbol, spot_token)
+            if ltp is None:
+                log.warning(f"{symbol}: cannot determine spot price — skipping option load")
                 continue
-            ltp = last["close"]
             log.info(f"Refreshing option tokens for {symbol} ATM≈{ltp:.0f}")
-            new_tokens = get_option_tokens(self.kite, symbol, ltp)
-            self.opt_tokens.update(new_tokens)
-        log.info(f"Total option tokens loaded: {len(self.opt_tokens)}")
+            new_tokens.update(get_option_tokens(self.kite, symbol, ltp))
+        self.opt_tokens.update(new_tokens)
+        if self.opt_tokens:
+            log.info(f"Option tokens loaded: {len(self.opt_tokens)} ✅")
+        else:
+            log.warning("Option tokens loaded: 0 — spot price unavailable or no strikes found")
+
+        # Subscribe new option tokens to the live WebSocket feed
+        if self._ticker and self.opt_tokens:
+            toks = list(self.opt_tokens.keys())
+            self._ticker.subscribe(toks)
+            self._ticker.set_mode(self._ticker.MODE_LTP, toks)
+            log.info(f"Subscribed {len(toks)} option tokens to WebSocket")
+
+        # If loading tokens late (past 9:20), the opening candle already closed.
+        # 1. Recompute live 5-min ST from today's intraday candles so bias is current.
+        # 2. Fetch the real 9:15 historical candle for each option and run OEH detection.
+        now_ist = datetime.now(IST)
+        if now_ist.time() > dtime(9, 20):
+            today_date = now_ist.date()
+            for symbol in self._active_today:
+                spot_token = NIFTY_SPOT_TOKEN if symbol == "NIFTY50" else SENSEX_SPOT_TOKEN
+                try:
+                    from_spot = datetime.combine(today_date, dtime(9, 15)).replace(tzinfo=IST)
+                    spot_hist = self.kite.historical_data(
+                        instrument_token = spot_token,
+                        from_date        = from_spot,
+                        to_date          = now_ist,
+                        interval         = "5minute",
+                        continuous       = False,
+                        oi               = False,
+                    )
+                    if len(spot_hist) >= ST_ATR_PERIOD:
+                        import numpy as _np
+                        _h = _np.array([b["high"]  for b in spot_hist])
+                        _l = _np.array([b["low"]   for b in spot_hist])
+                        _c = _np.array([b["close"] for b in spot_hist])
+                        trend_arr, _ = _supertrend(_h, _l, _c, ST_ATR_PERIOD, ST_MULTIPLIER)
+                        live_st5 = int(trend_arr[-1])
+                        self.indicators[symbol]["st5"] = live_st5
+                        log.info(
+                            f"{symbol}: live 5mST refreshed → "
+                            f"{'BUY ✅' if live_st5 == 1 else 'SELL 🔴'} "
+                            f"(from {len(spot_hist)} intraday candles)"
+                        )
+                except Exception as e:
+                    log.warning(f"{symbol}: live ST refresh failed — {e}")
+
+        if now_ist.time() > dtime(9, 20) and new_tokens:
+            # Run backfill in a background thread so the main loop is never blocked.
+            # WebSocket monitoring continues uninterrupted during the API calls.
+            tokens_snapshot = dict(new_tokens)
+            threading.Thread(
+                target=self._backfill_opening_candles,
+                args=(tokens_snapshot,),
+                daemon=True,
+            ).start()
+
+    def _backfill_opening_candles(self, tokens: dict) -> None:
+        """
+        Background thread: fetch the 9:15 AM opening candle for each option
+        and register OEH / 50% levels. Runs independently so the main loop
+        and WebSocket tick processing are never blocked.
+        """
+        now_ist = datetime.now(IST)
+        today   = now_ist.date()
+        from_dt = datetime.combine(today, dtime(9, 15)).replace(tzinfo=IST)
+        to_dt   = datetime.combine(today, dtime(9, 20)).replace(tzinfo=IST)
+        log.info(f"Backfill thread started: fetching 9:15 candle for {len(tokens)} options…")
+
+        done = 0
+        for token, opt_info in tokens.items():
+            try:
+                hist = self.kite.historical_data(
+                    instrument_token = token,
+                    from_date        = from_dt,
+                    to_date          = to_dt,
+                    interval         = "3minute",
+                    continuous       = False,
+                    oi               = False,
+                )
+                if not hist:
+                    continue
+                h   = hist[0]
+                bar = {
+                    "period": h["date"].replace(tzinfo=IST)
+                              if h["date"].tzinfo is None else h["date"],
+                    "open":  h["open"],
+                    "high":  h["high"],
+                    "low":   h["low"],
+                    "close": h["close"],
+                }
+                self._check_option_oeh(token, bar)
+                self._opt_level_on_candle(token, bar, opt_info)
+                done += 1
+            except Exception as e:
+                log.warning(f"Backfill failed for {opt_info['tsymbol']}: {e}")
+            time.sleep(0.05)   # stay within Kite rate limits
+
+        log.info(f"Backfill complete: {done}/{len(tokens)} options processed ✅")
 
     # ── Candle processing ─────────────────────────────────────────────────────
 
@@ -796,17 +1234,213 @@ class OEHAlerter:
         if ind["ema9"]:  ind["ema9"]  = a9  * close + (1 - a9)  * ind["ema9"]
         if ind["ema50"]: ind["ema50"] = a50 * close + (1 - a50) * ind["ema50"]
 
+    # ── Option 50% reversal watcher ──────────────────────────────────────────
+
+    def _opt_level_on_candle(self, token: int, bar: dict, opt_info: dict):
+        """
+        On the market-opening candle close: if the option formed OEH (open≈high),
+        register the 50% level for reversal tracking on subsequent ticks.
+        Works for both CE and PE (both can form OEH on their premium).
+        """
+        if token in self._opt_50_levels:
+            return  # already registered
+
+        # Only register from the 9:15 AM opening candle — not mid-day candles
+        bar_start = bar["period"]
+        if not (bar_start.hour == 9 and bar_start.minute == 15):
+            return
+
+        # Only ATM/OTM options that align with current bias
+        if not self._option_is_relevant(opt_info):
+            return
+
+        o, h, c = bar["open"], bar["high"], bar["close"]
+        if o == 0:
+            return
+
+        # Premium range filter — skip deep ITM and far OTM
+        sym          = "NIFTY50" if "NIFTY" in opt_info["tsymbol"] else "SENSEX"
+        px_lo, px_hi = OPTION_PX_RANGE[sym]
+        if not (px_lo <= o <= px_hi):
+            return
+
+        is_oeh  = (h - o) / o * 100 <= OPT_OEH_TOLERANCE
+        dropped = (o - c) / o * 100 >= MIN_DROP_PCT
+
+        if is_oeh and dropped:
+            level_50 = round(o * 0.50, 2)
+            self._opt_50_levels[token] = {
+                "tsymbol":     opt_info["tsymbol"],
+                "opt_type":    opt_info["type"],
+                "symbol":      sym,
+                "open_px":     o,
+                "level_50":    level_50,
+                "in_pullback": False,
+            }
+            log.info(
+                f"50% tracker set: {opt_info['tsymbol']}  "
+                f"open=high=₹{o:.1f}  50%=₹{level_50:.1f}"
+            )
+
+    def _opt_level_on_tick(self, token: int, ltp: float):
+        """
+        On every tick: check if price has pulled back below 50% level
+        and then crossed back above it → alert as reversal entry zone.
+        Resets after each alert so it can fire again on repeated pullbacks.
+        """
+        lvl = self._opt_50_levels.get(token)
+        if lvl is None:
+            return
+
+        # Gate on current SuperTrend direction — don't alert against the trend
+        sym      = lvl.get("symbol", "NIFTY50")
+        st_now   = self.indicators.get(sym, {}).get("st5", 0)
+        opt_type = lvl["opt_type"]
+        if opt_type == "CE" and st_now != 1:
+            return   # ST is bearish/neutral — suppress CE reversal alert
+        if opt_type == "PE" and st_now != -1:
+            return   # ST is bullish/neutral — suppress PE reversal alert
+
+        if not lvl["in_pullback"] and ltp < lvl["level_50"]:
+            lvl["in_pullback"] = True
+            log.info(f"50% tracker: {lvl['tsymbol']} dropped below ₹{lvl['level_50']:.1f} (pullback)")
+
+        if lvl["in_pullback"] and ltp >= lvl["level_50"]:
+            # Reset so the next pullback can fire again
+            lvl["in_pullback"] = False
+
+            opt_type  = lvl["opt_type"]
+            target_px = round(ltp * 1.55, 1)
+            stop_px   = round(ltp * 0.50, 1)
+            emoji     = "🚀" if opt_type == "CE" else "🔻"
+            action    = "BUY CALL" if opt_type == "CE" else "BUY PUT"
+            msg = (
+                f"{emoji} *{action} — {lvl['tsymbol']}*\n\n"
+                f"Open = High was ₹{lvl['open_px']:.0f}\n"
+                f"Pulled back to ₹{lvl['level_50']:.0f} (50%) — now reversing\n\n"
+                f"*Entry:   ₹{ltp:.2f}*  (market)\n"
+                f"*Target:  ₹{target_px}*  (+55%)\n"
+                f"*Stop:    ₹{stop_px}*  (-50%)\n\n"
+                f"⏰ {datetime.now(IST).strftime('%H:%M:%S')} IST"
+            )
+            send_alert(msg)
+            log.info(f"50% reversal BUY alert: {lvl['tsymbol']} entry=₹{ltp:.2f} "
+                     f"target=₹{target_px} stop=₹{stop_px}")
+
+    def add_price_alert(self, tsymbol: str, level: float, direction: str = "above") -> bool:
+        """
+        Register a one-shot price alert for any subscribed option.
+        direction: 'above' (alert when LTP crosses above level)
+                   'below' (alert when LTP crosses below level)
+        Returns True if the token was found, False if not yet loaded.
+        """
+        token = next(
+            (tok for tok, m in self.opt_tokens.items() if m["tsymbol"] == tsymbol),
+            None,
+        )
+        if token is None:
+            log.warning(f"Price alert: {tsymbol} not in subscribed tokens")
+            return False
+        self._price_alerts.append({
+            "tsymbol":   tsymbol,
+            "token":     token,
+            "level":     level,
+            "direction": direction,
+            "fired":     False,
+        })
+        log.info(f"Price alert set: {tsymbol} {direction} ₹{level:.2f}")
+        return True
+
+    def _check_price_alerts(self, token: int, ltp: float):
+        """Fire one-shot price alerts when LTP crosses the registered level."""
+        for alert in self._price_alerts:
+            if alert["fired"] or alert["token"] != token:
+                continue
+            hit = (
+                (alert["direction"] == "above" and ltp >= alert["level"]) or
+                (alert["direction"] == "below" and ltp <= alert["level"])
+            )
+            if hit:
+                alert["fired"] = True
+                arrow = "📈" if alert["direction"] == "above" else "📉"
+                msg = (
+                    f"{arrow} PRICE ALERT — {alert['tsymbol']}\n"
+                    f"CMP ₹{ltp:.2f} crossed {alert['direction']} ₹{alert['level']:.2f}"
+                )
+                send_alert(msg)
+                log.info(f"Price alert fired: {alert['tsymbol']} @ ₹{ltp:.2f}")
+
+    def _check_option_oeh(self, token: int, bar: dict):
+        """Secondary signal: detect OEH on the option premium candle itself."""
+        opt_info = self.opt_tokens.get(token)
+        if opt_info is None or opt_info["type"] != "CE":
+            return
+
+        now = datetime.now(IST)
+        if not (OEH_WINDOW_START <= now.time() <= OEH_WINDOW_END):
+            return
+
+        # Only the market-opening candle (9:15 AM) is a valid OEH candle.
+        # Mid-day candles where open≈high are a different pattern entirely.
+        bar_start = bar["period"]
+        if not (bar_start.hour == 9 and bar_start.minute == 15):
+            return
+
+        # Only ATM/OTM CEs aligned with current bullish bias
+        if not self._option_is_relevant(opt_info):
+            return
+
+        if bar["open"] == 0:
+            return
+
+        oeh_tol = OPT_OEH_TOLERANCE / 100
+        is_oeh  = (bar["high"] - bar["open"]) / bar["open"] <= oeh_tol
+        drop_ok = (bar["open"] - bar["close"]) / bar["open"] * 100 >= MIN_DROP_PCT
+
+        if not is_oeh or not drop_ok:
+            return
+
+        key = (opt_info["expiry"], opt_info["strike"])
+        if key in self._opt_oeh_alerted:
+            return
+        self._opt_oeh_alerted.add(key)
+
+        drop_pts = bar["open"] - bar["close"]
+        msg = (
+            f"📌 OPTION OEH — {opt_info['tsymbol']}\n"
+            f"Open = High = ₹{bar['open']:.1f}\n"
+            f"Dropped ₹{drop_pts:.1f} → close ₹{bar['close']:.1f} "
+            f"({drop_pts/bar['open']*100:.1f}% below open)\n"
+            f"⏰ {bar['period'].strftime('%H:%M')} | Expiry {opt_info['expiry']}\n"
+            f"Watch for 2 green reversal bars on spot to confirm entry."
+        )
+        send_alert(msg)
+        log.info(f"Option OEH alert: {opt_info['tsymbol']} open=high={bar['open']:.1f}")
+
+        # Register this option for 50% reversal tracking
+        self._opt_level_on_candle(token, bar, opt_info)
+
     def _process_completed_bar(self, token: int, bar: dict):
-        """Called when a 5-min candle completes. Run OEH detection for both instruments."""
+        """Called when a candle completes. Run OEH/OEL detection for both instruments."""
         symbol = self.spot_tokens.get(token)
-        if symbol is None or symbol not in self._active_today:
-            return   # option token or inactive instrument — skip
+        if symbol is None:
+            # Option candle — run OEH alert and 50% level registration for all strikes
+            self._check_option_oeh(token, bar)
+            opt_info = self.opt_tokens.get(token)
+            if opt_info:
+                self._opt_level_on_candle(token, bar, opt_info)
+            return
+        if symbol not in self._active_today:
+            return
 
         now = datetime.now(IST)
         t   = now.time()
 
         self._update_ema(symbol, bar["close"])
         ind = self.indicators[symbol]
+
+        # Refresh trendline cache on every completed spot candle
+        self._trendline_cache[symbol] = self._trendline_status(symbol)
 
         # Attach 5-min SuperTrend to bar so prev_bar check works
         bar["st_dir"] = ind["st5"]
@@ -830,6 +1464,8 @@ class OEHAlerter:
 
         log.info(f"{symbol} OEH state → {alert}")
 
+        tl = self._trendline_cache.get(symbol, "")
+
         if alert == "oeh_formed":
             opt_snap = get_option_chain_snapshot(
                 self.kite, self.opt_tokens, oeh_level=bar["open"]
@@ -839,6 +1475,8 @@ class OEHAlerter:
                 opt_snap, ind["st5"], ind["ema50"],
                 dma20=ind.get("dma20", 0), dma50=ind.get("dma50", 0),
             )
+            if tl:
+                msg += f"\n{tl}"
             send_alert(msg)
 
         elif alert.startswith("reversal_bar_"):
@@ -854,6 +1492,8 @@ class OEHAlerter:
                 symbol, bar, sm.oeh_spot or bar["open"], opt_snap, step,
                 dma20=ind.get("dma20", 0), dma50=ind.get("dma50", 0),
             )
+            if tl:
+                msg += f"\n{tl}"
             send_alert(msg)
 
             # ── Journal: log this signal (ATM option, system-default) ──────────
@@ -883,6 +1523,138 @@ class OEHAlerter:
                 sm.journal_sid = sid    # store so we can close it on exit
                 log.info(f"Journal: logged signal {sid} — ATM {atm_strike}CE @ {atm_px}")
 
+                # ── Auto-trader: place real/simulated order ─────────────────
+                ce_token = next(
+                    (tok for tok, m in self.opt_tokens.items()
+                     if m["strike"] == atm_strike and m["type"] == "CE"),
+                    None,
+                )
+                ce_tsymbol = next(
+                    (m["tsymbol"] for m in self.opt_tokens.values()
+                     if m["strike"] == atm_strike and m["type"] == "CE"),
+                    None,
+                )
+                exchange = "NFO" if symbol == "NIFTY50" else "BFO"
+                lot_qty  = 65   if symbol == "NIFTY50" else 10
+                if ce_token and ce_tsymbol and atm_px > 0:
+                    # Re-evaluate bias at entry time using live spot vs DMA levels
+                    spot_token  = NIFTY_SPOT_TOKEN if symbol == "NIFTY50" else SENSEX_SPOT_TOKEN
+                    last_spot   = self.builder.last_bar(spot_token)
+                    live_spot   = last_spot["close"] if last_spot else bar["close"]
+                    dma20       = ind.get("dma20", 0)
+                    dma50       = ind.get("dma50", 0)
+                    daily_st_ok = ind.get("daily_st", 1) == 1
+                    above_dma20 = (live_spot > dma20) if dma20 else True
+                    above_dma50 = (live_spot > dma50) if dma50 else True
+                    bias_score  = sum([daily_st_ok, above_dma20, above_dma50])
+                    log.info(
+                        f"{symbol}: bias at entry = {bias_score}/3 "
+                        f"(DailyST={'✅' if daily_st_ok else '❌'}  "
+                        f"DMA20={'✅' if above_dma20 else '❌'}  "
+                        f"DMA50={'✅' if above_dma50 else '❌'})"
+                    )
+                    self.auto_trader.on_entry(
+                        symbol     = symbol,
+                        tsymbol    = ce_tsymbol,
+                        exchange   = exchange,
+                        token      = ce_token,
+                        entry_ltp  = atm_px,
+                        lot_qty    = lot_qty,
+                        bias_score = bias_score,
+                        direction  = "CE",
+                    )
+
+        # ── OEL (PE) detection — runs alongside OEH ──────────────────────────
+        oel_sm  = self.oel_machines[symbol]
+        oel_alert = oel_sm.on_candle(
+            bar      = bar,
+            prev_bar = prev,
+            st_dir   = ind["st5"],
+            ema50    = ind["ema50"],
+            ema9     = ind["ema9"],
+            t        = t,
+        )
+
+        if oel_alert is None:
+            return
+
+        log.info(f"{symbol} OEL state → {oel_alert}")
+
+        if oel_alert == "oel_formed":
+            msg = fmt_oel_alert(
+                symbol, bar, oel_sm.oel_time or now.strftime("%H:%M"),
+                ind["st5"], ind["ema50"],
+                dma20=ind.get("dma20", 0), dma50=ind.get("dma50", 0),
+            )
+            if tl:
+                msg += f"\n{tl}"
+            send_alert(msg)
+
+        elif oel_alert.startswith("reversal_bar_dn_"):
+            n = int(oel_alert.split("_")[-1])
+            msg = fmt_oel_reversal_update(
+                symbol, bar, oel_sm.oel_spot or bar["open"], n, REVERSAL_BARS
+            )
+            send_alert(msg)
+
+        elif oel_alert == "entry_confirmed_pe":
+            opt_snap = get_option_chain_snapshot(self.kite, self.opt_tokens)
+            msg = fmt_pe_entry_alert(
+                symbol, bar, oel_sm.oel_spot or bar["open"], opt_snap, step,
+                dma20=ind.get("dma20", 0), dma50=ind.get("dma50", 0),
+            )
+            if tl:
+                msg += f"\n{tl}"
+            send_alert(msg)
+
+            atm_px_pe = next(
+                (r["ltp"] for r in opt_snap if r.get("atm") and r["type"] == "PE"),
+                0.0
+            )
+            if atm_px_pe > 0:
+                atm_strike_pe = int(round(
+                    (oel_sm.oel_spot or bar["open"]) / step
+                ) * step)
+                pe_token = next(
+                    (tok for tok, m in self.opt_tokens.items()
+                     if m["strike"] == atm_strike_pe and m["type"] == "PE"),
+                    None,
+                )
+                pe_tsymbol = next(
+                    (m["tsymbol"] for m in self.opt_tokens.values()
+                     if m["strike"] == atm_strike_pe and m["type"] == "PE"),
+                    None,
+                )
+                exchange = "NFO" if symbol == "NIFTY50" else "BFO"
+                lot_qty  = 65   if symbol == "NIFTY50" else 10
+                if pe_token and pe_tsymbol:
+                    # Bearish bias check: majority of daily indicators must be bearish
+                    spot_token  = NIFTY_SPOT_TOKEN if symbol == "NIFTY50" else SENSEX_SPOT_TOKEN
+                    last_spot   = self.builder.last_bar(spot_token)
+                    live_spot   = last_spot["close"] if last_spot else bar["close"]
+                    dma20_val   = ind.get("dma20", 0)
+                    dma50_val   = ind.get("dma50", 0)
+                    daily_st_bear = ind.get("daily_st", 1) == -1
+                    below_dma20   = (live_spot < dma20_val) if dma20_val else False
+                    below_dma50   = (live_spot < dma50_val) if dma50_val else False
+                    bear_score    = sum([daily_st_bear, below_dma20, below_dma50])
+                    log.info(
+                        f"{symbol}: PE bias at entry = {bear_score}/3 bearish "
+                        f"(DailyST={'❌' if daily_st_bear else '✅'}  "
+                        f"DMA20={'❌ below' if below_dma20 else '✅ above'}  "
+                        f"DMA50={'❌ below' if below_dma50 else '✅ above'})"
+                    )
+                    self.auto_trader.on_entry(
+                        symbol     = symbol,
+                        tsymbol    = pe_tsymbol,
+                        exchange   = exchange,
+                        token      = pe_token,
+                        entry_ltp  = atm_px_pe,
+                        lot_qty    = lot_qty,
+                        bias_score = bear_score,
+                        direction  = "PE",
+                    )
+
     # ── WebSocket callbacks ───────────────────────────────────────────────────
 
     def on_ticks(self, ws, ticks):
@@ -892,6 +1664,12 @@ class OEHAlerter:
             ltp   = tick.get("last_price") or tick.get("last_traded_price", 0)
             if ltp == 0:
                 continue
+
+            # Feed every option tick to auto_trader, price alerts, and 50% tracker
+            if token in self.opt_tokens:
+                self.auto_trader.on_tick(token, ltp)
+                self._check_price_alerts(token, ltp)
+                self._opt_level_on_tick(token, ltp)
 
             completed = self.builder.on_tick(token, ltp, now)
             if completed:
@@ -964,6 +1742,7 @@ class OEHAlerter:
         # Reset state machines for active instruments
         for sym in self._active_today:
             self.state_machines[sym].reset()
+            self.oel_machines[sym].reset()
 
         # Connect WebSocket
         ticker = KiteTicker(settings.KITE_API_KEY, settings.KITE_ACCESS_TOKEN)
@@ -973,10 +1752,13 @@ class OEHAlerter:
         ticker.on_close     = self.on_close
         ticker.on_reconnect = self.on_reconnect
 
+        self._ticker = ticker
         log.info("Connecting to Kite WebSocket…")
         ticker.connect(threaded=True)
 
-        eod_done = False
+        eod_done        = False
+        last_sync_min   = -1   # last minute we ran position sync (every 2 min)
+        last_summary_5m = -1   # last 5-min bucket we sent the position summary
 
         # Main loop — keep alive until market close
         try:
@@ -989,10 +1771,27 @@ class OEHAlerter:
                         eod_done = True
                     log.info("Market closed. Exiting.")
                     break
-                # Refresh option tokens at 9:22 AM (after spot has ticked a bit)
-                if (now >= dtime(9, 22) and now <= dtime(9, 24) and
-                        self.brief_sent and not self.opt_tokens):
+
+                # Load option tokens once after 9:22 AM (works even if restarted late)
+                if (now >= dtime(9, 22) and self.brief_sent and not self.opt_tokens):
                     self.refresh_option_tokens()
+
+                cur_min = now_ist.minute
+
+                # Sync open positions every 2 minutes (catch manually entered trades)
+                if (self.opt_tokens and
+                        cur_min % 2 == 0 and cur_min != last_sync_min):
+                    last_sync_min = cur_min
+                    self._sync_positions()
+
+                # Broadcast open positions to Telegram every 5 minutes
+                bucket_5m = now_ist.hour * 60 + cur_min - (cur_min % 5)
+                if (self.opt_tokens and bucket_5m != last_summary_5m):
+                    last_summary_5m = bucket_5m
+                    summary = self.auto_trader.position_summary(indicators=self.indicators)
+                    if summary:
+                        send_alert(summary)
+
                 time.sleep(10)
         except KeyboardInterrupt:
             log.info("Interrupted by user")
@@ -1001,9 +1800,141 @@ class OEHAlerter:
             ticker.stop()
             log.info("Stopped.")
 
+    def _trendline_status(self, symbol: str) -> str:
+        """
+        Compute trendline context from the last 20 spot candles.
+        Returns a short info string appended to OEH/OEL alerts (info-only — no
+        effect on entry/exit logic).
+
+        Two signals combined:
+          • Linear regression slope over last 20 closes (normalised as %/candle)
+          • Swing structure: higher lows / lower highs over last 20 bars (window=2)
+        """
+        spot_token = NIFTY_SPOT_TOKEN if symbol == "NIFTY50" else SENSEX_SPOT_TOKEN
+        history    = self.builder._history.get(spot_token, [])
+        if len(history) < 10:
+            return ""
+
+        recent = history[-20:]
+        closes = [b["close"] for b in recent]
+        lows   = [b["low"]   for b in recent]
+        highs  = [b["high"]  for b in recent]
+        n      = len(closes)
+
+        # ── Linear regression slope ──────────────────────────────────────────
+        mean_x  = (n - 1) / 2
+        mean_y  = sum(closes) / n
+        num     = sum((i - mean_x) * (closes[i] - mean_y) for i in range(n))
+        den     = sum((i - mean_x) ** 2                   for i in range(n))
+        slope   = num / den if den else 0.0
+        slope_pct = slope / mean_y * 100       # % of price per candle
+        if slope_pct > 0.02:
+            slope_str = f"↗ +{slope_pct:.2f}%/bar"
+        elif slope_pct < -0.02:
+            slope_str = f"↘ {slope_pct:.2f}%/bar"
+        else:
+            slope_str = "→ flat"
+
+        # ── Swing structure (window = 2 bars either side) ────────────────────
+        W = 2
+        swing_lows, swing_highs = [], []
+        for i in range(W, n - W):
+            if lows[i]  == min(lows[i-W:i+W+1]):
+                swing_lows.append(lows[i])
+            if highs[i] == max(highs[i-W:i+W+1]):
+                swing_highs.append(highs[i])
+
+        higher_lows  = len(swing_lows)  >= 2 and swing_lows[-1]  > swing_lows[-2]
+        lower_lows   = len(swing_lows)  >= 2 and swing_lows[-1]  < swing_lows[-2]
+        higher_highs = len(swing_highs) >= 2 and swing_highs[-1] > swing_highs[-2]
+        lower_highs  = len(swing_highs) >= 2 and swing_highs[-1] < swing_highs[-2]
+
+        if higher_lows and higher_highs:
+            structure = "HH+HL ↗ Uptrend"
+        elif higher_lows:
+            structure = "Higher Lows ↗"
+        elif lower_highs and lower_lows:
+            structure = "LL+LH ↘ Downtrend"
+        elif lower_highs:
+            structure = "Lower Highs ↘"
+        else:
+            structure = "Sideways ↔"
+
+        return f"Trendline: {structure} | Slope {slope_str}"
+
+    def _sync_positions(self):
+        """
+        Fetch open positions from Kite every 2 minutes.
+        Any position not already tracked by auto_trader is registered for
+        WebSocket monitoring with target/stop/trailing management.
+
+        Entry price = price from the most recent BUY trade for that symbol
+        (not average_price, which gets distorted by multiple buys/sells).
+        """
+        try:
+            positions = self.kite.positions()["day"]
+            open_pos  = [p for p in positions if p["quantity"] > 0]
+        except Exception as e:
+            log.warning(f"Position sync: positions API error — {e}")
+            return
+
+        # Build a lookup: tradingsymbol → most recent BUY trade price
+        latest_buy: dict[str, float] = {}
+        try:
+            trades = self.kite.trades()
+            # Sort oldest→newest so the last assignment wins (most recent BUY)
+            for t in sorted(trades, key=lambda x: x.get("fill_timestamp") or
+                                                   x.get("order_timestamp", "")):
+                if t.get("transaction_type", "").upper() == "BUY" and t.get("price", 0) > 0:
+                    latest_buy[t["tradingsymbol"]] = float(t["price"])
+        except Exception as e:
+            log.warning(f"Position sync: trades API error — {e} (falling back to avg price)")
+
+        for p in open_pos:
+            tsymbol = p["tradingsymbol"]
+            qty     = p["quantity"]
+
+            if qty == 0:
+                continue
+
+            # Prefer most-recent BUY trade price; fall back to average_price
+            entry_px = latest_buy.get(tsymbol) or p["average_price"]
+            if entry_px == 0:
+                continue
+
+            # Find this option in our subscribed token map
+            token = next(
+                (tok for tok, m in self.opt_tokens.items()
+                 if m["tsymbol"] == tsymbol),
+                None,
+            )
+            if token is None:
+                continue   # not a tracked option (e.g. future or different expiry)
+
+            sym       = "NIFTY50" if "NIFTY" in tsymbol else "SENSEX"
+            direction = "CE" if tsymbol.endswith("CE") else "PE"
+            exchange  = "NFO" if sym == "NIFTY50" else "BFO"
+
+            registered = self.auto_trader.watch_position(
+                symbol    = sym,
+                tsymbol   = tsymbol,
+                exchange  = exchange,
+                token     = token,
+                entry_px  = entry_px,
+                qty       = qty,
+                direction = direction,
+            )
+            if registered:
+                src = "last BUY trade" if tsymbol in latest_buy else "avg price"
+                log.info(
+                    f"Position sync: registered {tsymbol} qty={qty} "
+                    f"@ ₹{entry_px:.2f} ({src})"
+                )
+
     def _eod_handler(self):
         """At market close: close any open journal positions, send daily summary."""
         log.info("EOD: closing open journal positions and sending summary…")
+        self.auto_trader.force_close_all()
 
         # Get last known LTP for each instrument's ATM option (approximate)
         ltp_map: dict[str, float] = {}
